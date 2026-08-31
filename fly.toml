@@ -1,0 +1,31 @@
+# `linkedin-profile-api` was already taken; names are unique across all of Fly.
+app = "linkedin-profile-json"
+
+# LinkedIn watches where a session is used. A cookie created in India and then
+# replayed from Virginia looks like a stolen session and gets challenged, so
+# the server sits near the people whose cookies it carries.
+# Mumbai (bom) would be closer but Fly deprecated it - it refuses new machines.
+primary_region = "sin"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  # Callers put live session cookies in the request body. Never plain HTTP.
+  force_https = true
+  # Safe to sleep: the server stores no session. Callers hold their own cookies
+  # and get the rotated pair back in the `session` field of every response.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

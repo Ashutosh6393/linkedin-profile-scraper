@@ -1,0 +1,16 @@
+# The Dockerfile copies files by name, so this is belt and braces. It also
+# keeps the build context small.
+.env
+.session.json
+.session.tmp
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.github/
+docs/
+fly.toml
+Dockerfile
+CLAUDE.md
+test_parse.py

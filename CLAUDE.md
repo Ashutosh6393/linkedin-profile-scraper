@@ -15,7 +15,7 @@ change would need a browser, it is the wrong change.
 
 ```bash
 uv sync                              # install from uv.lock
-uv run python test_parse.py          # offline self-check, no cookies needed
+uv run python test_parse.py          # offline self-check, no cookies, no network
 uv run uvicorn main:app --reload     # serve on :8000, docs at /docs
 ```
 
@@ -39,11 +39,18 @@ what breaks against LinkedIn.
 
 ## Rules that matter
 
-**Never commit secrets.** `.env` and `.session.json` both hold live session
-cookies. Both are gitignored. Check `git status` before committing.
+**The server holds no credentials, and it stays that way.** Cookies arrive in
+the request body and are returned in the `session` field. There is no `.env`,
+no `.session.json`, and no config. Do not add a fallback that reads cookies
+from the environment, and never write a caller's cookies to disk or a log —
+they belong to someone else. See ADR 0007.
+
+Since cookies now arrive over the network, they are untrusted input. The
+validation in `Voyager.__init__` stops `;` and line breaks from reaching the
+`Cookie` header. Keep it.
 
 **Do not hammer LinkedIn.** One profile lookup is ten requests. The account
-whose cookie is in `.env` gets banned, not the code. When testing:
+behind the cookie gets banned, not the code. When testing:
 
 - One request is a test. A loop is a scrape.
 - Never put a profile fetch in a retry loop or a benchmark.

@@ -4,10 +4,7 @@ Voyager is LinkedIn's own private JSON API - the same one their web app talks to
 We authenticate with a normal logged-in session cookie. No browser involved.
 """
 import asyncio
-import json
-import os
 import re
-from pathlib import Path
 from urllib.parse import unquote
 
 import httpx
@@ -36,10 +33,6 @@ DELAY_BETWEEN_CALLS = 0.4
 # LinkedIn answers the first hit with a 302 to the same URL. One hop is normal;
 # more than a couple means the session is dead, so fail fast instead of looping.
 MAX_REDIRECTS = 4
-
-# Where the rotated cookies get parked so a restart does not lose the session.
-# Holds live credentials, so it is gitignored like .env.
-SESSION_FILE = Path(os.getenv("LINKEDIN_SESSION_FILE", ".session.json"))
 
 
 class LinkedInError(Exception):
@@ -228,16 +221,15 @@ def parse_profile(core, sections, profile_url=None):
 class Voyager:
     """Talks to Voyager using a logged-in session cookie."""
 
-    def __init__(
-        self,
-        li_at: str,
-        jsessionid: str,
-        timeout: float = 20.0,
-        session_file=None,
-    ):
+    def __init__(self, li_at: str, jsessionid: str, timeout: float = 20.0):
         if not li_at or not jsessionid:
+            raise LinkedInError("li_at and jsessionid are both required.", 400)
+        # Cookies arrive in a request body, so they are untrusted input. They
+        # get pasted straight into a Cookie header; a ';' or a newline there
+        # would let a caller forge extra cookies or extra headers.
+        if any(c in li_at + jsessionid for c in ";\r\n"):
             raise LinkedInError(
-                "LINKEDIN_LI_AT and LINKEDIN_JSESSIONID must be set.", 500
+                "Cookie values must not contain ';' or line breaks.", 400
             )
         # The CSRF token is literally the JSESSIONID value, quotes stripped.
         token = jsessionid.strip('"')
@@ -248,13 +240,6 @@ class Voyager:
         # stale copy, and bounces us forever. One name -> one value avoids it.
         self._jar = {"li_at": li_at, "JSESSIONID": f'"{token}"'}
         self._jar_lock = asyncio.Lock()
-        self._session_file = Path(session_file) if session_file else SESSION_FILE
-        # A saved session outranks .env: LinkedIn rotates these cookies, so the
-        # value we last received beats the one pasted in by hand days ago.
-        saved = self._load_session()
-        if saved.get("li_at"):
-            self._jar.update(saved)
-            token = str(self._jar.get("JSESSIONID", token)).strip('"')
         self._headers = {
             "csrf-token": token,
             "x-restli-protocol-version": "2.0.0",
@@ -275,29 +260,22 @@ class Voyager:
     async def aclose(self):
         await self._client.aclose()
 
-    def _load_session(self) -> dict:
-        """Read the cookies saved by a previous run. Missing or corrupt is fine."""
-        try:
-            data = json.loads(self._session_file.read_text("utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
+    @property
+    def cookies(self) -> dict:
+        """The session as it stands now, in the shape a caller sends it back.
 
-    def _save_session(self):
-        """Write via a temp file so a crash cannot leave a half-written jar."""
-        try:
-            tmp = self._session_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._jar), "utf-8")
-            tmp.replace(self._session_file)
-        except OSError:
-            # A read-only disk should not take the whole API down. We just lose
-            # the session on restart, which is what happened before this existed.
-            pass
+        LinkedIn rotates these mid-session, so by the end of a request they may
+        differ from what arrived. Nothing is stored server-side, so handing them
+        back is the only way the caller can stay in step.
+        """
+        return {
+            "li_at": self._jar.get("li_at"),
+            "jsessionid": self._headers["csrf-token"],
+        }
 
     async def _absorb(self, response):
         """Take any rotated cookie LinkedIn hands back and keep it."""
         async with self._jar_lock:
-            changed = False
             for raw in response.headers.get_list("set-cookie"):
                 pair = raw.split(";", 1)[0].strip()
                 if "=" not in pair:
@@ -305,15 +283,10 @@ class Voyager:
                 name, value = (part.strip() for part in pair.split("=", 1))
                 if not value or value in ('""', '"-"', "-"):
                     continue  # a deletion, not a new value
-                if self._jar.get(name) == value:
-                    continue
                 self._jar[name] = value
-                changed = True
                 if name == "JSESSIONID":
                     # csrf-token must always match the current JSESSIONID.
                     self._headers["csrf-token"] = value.strip('"')
-            if changed:
-                self._save_session()
 
     async def _send(self, path, params):
         """One GET, following LinkedIn's self-redirects with current cookies."""
