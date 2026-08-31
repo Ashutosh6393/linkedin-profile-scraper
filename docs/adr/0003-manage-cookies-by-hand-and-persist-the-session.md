@@ -4,8 +4,14 @@ Date: 2026-08-30
 
 ## Status
 
-Accepted. This is the least obvious decision in the project and the one that
-cost the most debugging, so it is written up in full.
+Accepted, except for point 5. This is the least obvious decision in the
+project and the one that cost the most debugging, so it is written up in full.
+
+**Point 5 (persisting the jar to `.session.json`) is superseded by
+[ADR 0007](0007-the-caller-brings-the-cookies.md).** The server no longer owns
+a session to persist. Everything else here — the hand-rolled jar, the manual
+redirects, the `csrf-token` resync — is still exactly how the client works,
+and the three failure modes below are still why.
 
 ## Context
 

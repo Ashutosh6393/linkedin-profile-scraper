@@ -4,7 +4,12 @@ Date: 2026-08-30
 
 ## Status
 
-Accepted.
+Accepted, except for the HTTP verb decision.
+
+**"Keep both verbs" is superseded by
+[ADR 0007](0007-the-caller-brings-the-cookies.md).** `GET /profile` is removed:
+the request now carries the caller's session cookies, and a query string is the
+wrong place for a credential. The FastAPI and uv decisions stand.
 
 ## Context
 

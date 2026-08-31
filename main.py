@@ -1,51 +1,61 @@
-"""HTTP wrapper around the Voyager client."""
-import os
+"""HTTP wrapper around the Voyager client.
+
+The server holds no LinkedIn credentials of its own. Every request carries the
+caller's cookies, so there is nothing here to expire, rotate, or keep secret,
+and nothing is ever written to disk. See ADR 0007.
+"""
 from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from linkedin import LinkedInError, Voyager
 
-load_dotenv()
-
-# One client for the whole app. It must be shared: LinkedIn rotates the li_at
-# cookie mid-session and hands the replacement back on a redirect. A per-request
-# client would drop it and the session would die after the first call.
-_voyager: Voyager | None = None
+# One Voyager per cookie pair, reused across requests. Reuse is not an
+# optimisation: LinkedIn rotates li_at mid-session and hands the replacement
+# back on a redirect, so a client built per request would drop it (ADR 0003).
+_clients: dict[tuple[str, str], Voyager] = {}
+MAX_CLIENTS = 32
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _voyager
-    li_at = os.getenv("LINKEDIN_LI_AT", "")
-    jsessionid = os.getenv("LINKEDIN_JSESSIONID", "")
-    _voyager = Voyager(li_at, jsessionid) if li_at and jsessionid else None
     yield
-    if _voyager:
-        await _voyager.aclose()
+    for client in _clients.values():
+        await client.aclose()
+    _clients.clear()
 
 
 app = FastAPI(
     title="LinkedIn Profile API",
-    description="Give it a LinkedIn profile URL, get structured JSON back.",
-    version="1.0.0",
+    description=(
+        "Give it a LinkedIn profile URL and your own session cookies, "
+        "get structured JSON back."
+    ),
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
 class ProfileRequest(BaseModel):
-    url: str
+    url: str = Field(min_length=1, examples=["https://www.linkedin.com/in/name/"])
+    # Both cookies come from the caller's own logged-in browser. The server
+    # neither stores them nor has any of its own.
+    li_at: str = Field(min_length=1)
+    jsessionid: str = Field(min_length=1)
 
 
-def _client() -> Voyager:
-    if _voyager is None:
-        raise LinkedInError(
-            "LINKEDIN_LI_AT and LINKEDIN_JSESSIONID are not set.", 500
-        )
-    return _voyager
+async def _client(body: ProfileRequest) -> Voyager:
+    key = (body.li_at, body.jsessionid)
+    if key not in _clients:
+        # ponytail: plain FIFO evict, no TTL. A rotation makes a new key and
+        # strands the old client; the cap is what eventually clears it. Swap
+        # for an LRU with an idle timeout if that churn ever matters.
+        if len(_clients) >= MAX_CLIENTS:
+            await _clients.pop(next(iter(_clients))).aclose()
+        _clients[key] = Voyager(body.li_at, body.jsessionid)
+    return _clients[key]
 
 
 @app.exception_handler(LinkedInError)
@@ -55,22 +65,23 @@ async def _linkedin_error(_request, exc: LinkedInError):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "credentialsConfigured": _voyager is not None}
-
-
-@app.get("/profile")
-async def profile_get(url: str):
-    return await _client().fetch_profile(url)
+    return {"status": "ok"}
 
 
 @app.post("/profile")
-async def profile_post(body: ProfileRequest):
-    return await _client().fetch_profile(body.url)
+async def profile(body: ProfileRequest):
+    client = await _client(body)
+    result = await client.fetch_profile(body.url)
+    # LinkedIn may have rotated the session while we worked. Hand the current
+    # cookies back: the pair the caller sent may already be superseded, and the
+    # server keeps no copy for them to fall back on.
+    result["session"] = client.cookies
+    return result
 
 
 @app.get("/")
 async def root():
     return {
-        "usage": "GET /profile?url=<linkedin profile url>  or  POST /profile",
+        "usage": "POST /profile with {url, li_at, jsessionid}",
         "docs": "/docs",
     }

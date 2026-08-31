@@ -13,7 +13,6 @@ Dependencies are managed with [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                         # builds .venv from pyproject.toml + uv.lock
-cp .env.example .env            # then fill in the two cookie values
 uv run uvicorn main:app --reload
 ```
 
@@ -21,38 +20,67 @@ uv run uvicorn main:app --reload
 reproducible. `uv run` uses the project environment without activating it.
 No global installs, no `pip`.
 
+There is nothing to configure. **The server holds no LinkedIn credentials.**
+Every request carries the caller's own cookies, and none of them are stored,
+logged, or written to disk. See [ADR 0007](docs/adr/).
+
 Open http://127.0.0.1:8000/docs for the interactive docs.
 
 ### Getting the two cookie values
 
 1. Log in to linkedin.com in Chrome.
 2. Open DevTools → **Application** → **Cookies** → `https://www.linkedin.com`.
-3. Copy `li_at` into `LINKEDIN_LI_AT`.
-4. Copy `JSESSIONID` into `LINKEDIN_JSESSIONID`. Drop the surrounding quotes.
+3. Copy `li_at`. That is the cookie that actually authenticates you.
+4. Copy `JSESSIONID`. Drop the surrounding quotes. It doubles as the CSRF token.
 
-Use a throwaway LinkedIn account. See [Known limitations](#known-limitations).
+Send both in the request body. Use a throwaway LinkedIn account — see
+[Known limitations](#known-limitations).
 
-You paste these **once**. LinkedIn rotates them as you use the API, and the
-current values are kept in `.session.json` (gitignored) so a restart does not
-lose the session. Delete that file if you ever want to force a fresh start
-from `.env`.
+**Keep the `session` object from each response and send that next time.**
+LinkedIn rotates these cookies as you use them, which retires the old values.
+The server is stateless, so it cannot remember the new ones for you.
 
 ---
 
 ## API
 
-### `GET /profile?url=<linkedin profile url>`
 ### `POST /profile`
 
-```json
-{ "url": "https://www.linkedin.com/in/ashutoshv19/" }
-```
+All three fields are required.
 
-Both return the same body.
+```json
+{
+  "url": "https://www.linkedin.com/in/ashutoshv19/",
+  "li_at": "AQEDA...",
+  "jsessionid": "ajax:1234567890"
+}
+```
 
 ```bash
-curl "http://127.0.0.1:8000/profile?url=https://www.linkedin.com/in/ashutoshv19/"
+curl -X POST http://127.0.0.1:8000/profile \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://www.linkedin.com/in/ashutoshv19/",
+       "li_at":"AQEDA...","jsessionid":"ajax:1234567890"}'
 ```
+
+There is no `GET /profile`. Cookies in a query string land in access logs,
+proxies, and browser history, so the only way in is a request body.
+
+#### The `session` field
+
+Every response ends with the cookies as they stand *after* the call:
+
+```json
+{ "session": { "li_at": "AQEDA...", "jsessionid": "ajax:0987654321" } }
+```
+
+Store those and send them on your next request. LinkedIn rotates the session
+while you use it and retires the old values, so the pair you sent may already
+be dead. The server keeps no copy — that field is your only way to keep up.
+
+One client is held per cookie pair while the process lives, because a client
+built per request would throw the rotated cookie away (ADR 0003). It is held in
+memory only, and never written to disk.
 
 <details>
 <summary>Response shape</summary>
@@ -103,7 +131,8 @@ curl "http://127.0.0.1:8000/profile?url=https://www.linkedin.com/in/ashutoshv19/
   "languages": [{ "name": "...", "proficiency": "..." }],
   "projects": [{ "title": "...", "description": "...", "url": "...",
                  "startDate": "...", "endDate": "..." }],
-  "courses": [], "honors": [], "volunteering": []
+  "courses": [], "honors": [], "volunteering": [],
+  "session": { "li_at": "AQEDA...", "jsessionid": "ajax:0987654321" }
 }
 ```
 </details>
@@ -111,14 +140,15 @@ curl "http://127.0.0.1:8000/profile?url=https://www.linkedin.com/in/ashutoshv19/
 ### `GET /health`
 
 ```json
-{ "status": "ok", "credentialsConfigured": true }
+{ "status": "ok" }
 ```
 
 ### Errors
 
 | Status | Meaning |
 |---|---|
-| 400 | The URL is not a `/in/<name>` profile URL |
+| 400 | Not a `/in/<name>` profile URL, or a cookie holds `;` or a line break |
+| 422 | `url`, `li_at`, or `jsessionid` is missing or empty |
 | 404 | Profile does not exist, or is not visible to the logged-in account |
 | 429 | LinkedIn is rate limiting the session |
 | 502 | Cookie rejected or expired, or Voyager returned an error |
@@ -207,8 +237,8 @@ because the obvious implementation is wrong:
 
 Three things follow from that, and all three are needed:
 
-1. **One client for the app's lifetime**, built in the FastAPI lifespan hook.
-   The cookie jar is the session; it has to survive between requests.
+1. **One client per cookie pair, kept for the process's lifetime.** The cookie
+   jar is the session; it has to survive between requests.
 2. **Cookies are managed by hand, not by httpx's jar.** The jar is
    domain-aware. We seed `li_at` on `.linkedin.com`, LinkedIn sets the rotated
    one on `.www.linkedin.com`, and then *both* get sent. LinkedIn sees the
@@ -216,11 +246,10 @@ Three things follow from that, and all three are needed:
    name one value. Redirects are followed manually so every hop resends the
    current cookies, and `csrf-token` is re-synced whenever `JSESSIONID`
    changes.
-3. **The jar is written to `.session.json` on every rotation.** Without this,
-   a restart falls back to whatever was pasted into `.env`, which LinkedIn may
-   already have superseded — so the service works once, then 502s until you
-   re-copy cookies by hand. The saved file outranks `.env` on startup. Writes
-   go through a temp file and an atomic replace.
+3. **The rotated pair is returned to the caller** as `session`. These are
+   somebody else's credentials, so the server will not persist them. Handing
+   them back is what stops a restart from stranding the caller on a cookie
+   LinkedIn has already superseded.
 
 `MAX_REDIRECTS` is 4, so a genuinely dead session fails after four calls
 instead of hammering LinkedIn twenty times.
@@ -244,9 +273,9 @@ uv run python test_parse.py
 Runs against captured Voyager payloads. No network, no cookies needed. It
 covers URL parsing, date ranges, current-job detection, image size selection,
 the empty-section fallback, and the session logic: a rotated cookie is
-absorbed and saved, `csrf-token` follows `JSESSIONID`, an empty cookie value
-is treated as a deletion, a saved session beats `.env` on restart, and a
-corrupt session file falls back instead of crashing.
+absorbed and handed back in `session`, `csrf-token` follows `JSESSIONID`, an
+empty cookie value is treated as a deletion, and a cookie carrying `;` or a
+line break is rejected before it can reach a header.
 
 ---
 
@@ -256,9 +285,13 @@ corrupt session file falls back instead of crashing.
   use can be restricted or banned. Use a throwaway account.
 - **Cookies expire.** `li_at` nominally lasts a year but dies on logout or a
   password change. Rotation is handled (see below), expiry is not. When it
-  finally dies every request returns 502 and you re-copy from the browser.
-- **`.session.json` holds live credentials.** It is gitignored, but it is a
-  plaintext file on disk. On a shared host, use a secrets store instead.
+  finally dies every request returns 502 and the caller re-copies from the
+  browser.
+- **Callers send live credentials over the wire.** Deploy behind HTTPS only.
+  Nothing is stored or logged server-side, but the cookies do sit in memory
+  for as long as the process holds that client.
+- **Anyone with a cookie can call it.** There is no auth and no per-caller
+  rate limit. Put both in front of it before opening it to the public.
 - **Rate limits are real and unpublished.** Each profile lookup costs ten
   requests. The client throttles itself to 3 in flight with a 0.4s gap
   (`MAX_CONCURRENCY` / `DELAY_BETWEEN_CALLS` in `linkedin.py`) so a lookup
@@ -285,6 +318,11 @@ Any host that runs a Python web service works. Render, Railway, or Fly.
 
 - Build command: `uv sync --frozen`
 - Start command: `uv run uvicorn main:app --host 0.0.0.0 --port $PORT`
-- Set `LINKEDIN_LI_AT` and `LINKEDIN_JSESSIONID` as environment variables in
-  the host's dashboard. Never commit them.
-- All three hosts terminate HTTPS for you.
+- **No environment variables, no secrets, no volume.** The service is
+  stateless, so a redeploy or a restart costs nothing.
+- All three hosts terminate HTTPS for you. Do not run this over plain HTTP —
+  callers put live session cookies in the request body.
+- Running more than one instance is fine, with one caveat: a caller who fires
+  two requests at once can have them land on different instances, which then
+  rotate the same session independently and supersede each other. Serialise
+  per caller, or accept the occasional 502 and a re-copied cookie.

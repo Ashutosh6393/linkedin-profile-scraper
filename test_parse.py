@@ -2,9 +2,7 @@
 
 Run it with:  python test_parse.py
 """
-import json
-import tempfile
-from pathlib import Path
+import asyncio
 
 from linkedin import LinkedInError, Voyager, parse_profile, slug_from_url
 
@@ -70,42 +68,46 @@ class _Headers:
         return self._set_cookies if name == "set-cookie" else []
 
 
-def check_session_persistence():
-    """A rotated cookie must survive a restart, or the session dies."""
-    import asyncio
+def check_rotation():
+    """A rotated cookie must be picked up and handed back to the caller."""
+    client = Voyager("old-li-at", "ajax:111")
+    assert client._jar["li_at"] == "old-li-at"
+    assert client._headers["csrf-token"] == "ajax:111"
 
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "session.json"
+    # LinkedIn hands back a rotated li_at and a new JSESSIONID.
+    asyncio.run(client._absorb(FakeResponse([
+        "li_at=NEW-li-at; Path=/; Domain=.www.linkedin.com; HttpOnly",
+        'JSESSIONID="ajax:222"; Path=/; Domain=.linkedin.com',
+        "liap=true; Path=/",
+        "lidc=; Path=/",  # a deletion, must be ignored
+    ])))
 
-        first = Voyager("old-li-at", "ajax:111", session_file=path)
-        assert first._jar["li_at"] == "old-li-at"
-        assert first._headers["csrf-token"] == "ajax:111"
+    assert client._jar["li_at"] == "NEW-li-at"
+    assert client._headers["csrf-token"] == "ajax:222", "csrf must track JSESSIONID"
+    assert "lidc" not in client._jar, "empty value is a deletion, not a cookie"
 
-        # LinkedIn hands back a rotated li_at and a new JSESSIONID.
-        asyncio.run(first._absorb(FakeResponse([
-            "li_at=NEW-li-at; Path=/; Domain=.www.linkedin.com; HttpOnly",
-            'JSESSIONID="ajax:222"; Path=/; Domain=.linkedin.com',
-            "liap=true; Path=/",
-            "lidc=; Path=/",  # a deletion, must be ignored
-        ])))
+    # The caller gets the new pair back, unquoted, ready to send next time.
+    assert client.cookies == {"li_at": "NEW-li-at", "jsessionid": "ajax:222"}
 
-        assert first._jar["li_at"] == "NEW-li-at"
-        assert first._headers["csrf-token"] == "ajax:222", "csrf must track JSESSIONID"
-        assert "lidc" not in first._jar, "empty value is a deletion, not a cookie"
-        assert path.exists(), "rotation should have been written to disk"
 
-        saved = json.loads(path.read_text("utf-8"))
-        assert saved["li_at"] == "NEW-li-at"
+def check_cookie_validation():
+    """Cookies arrive from the network, so they are untrusted input."""
+    # A ';' or a line break could forge extra cookies or extra headers.
+    for bad in ["good; li_at=evil", "line\r\nX-Evil: 1"]:
+        for pair in [(bad, "ajax:1"), ("li-at", bad)]:
+            try:
+                Voyager(*pair)
+                raise AssertionError(f"should have rejected: {bad!r}")
+            except LinkedInError as exc:
+                assert exc.status == 400
 
-        # A restart re-reads .env, but the saved session must win.
-        second = Voyager("old-li-at", "ajax:111", session_file=path)
-        assert second._jar["li_at"] == "NEW-li-at", "restart lost the rotated cookie"
-        assert second._headers["csrf-token"] == "ajax:222"
-
-        # A corrupt file must not crash startup.
-        path.write_text("{not json", "utf-8")
-        third = Voyager("env-li-at", "ajax:333", session_file=path)
-        assert third._jar["li_at"] == "env-li-at", "should fall back to .env"
+    # Missing halves are rejected too. One cookie is not a session.
+    for pair in [("", "ajax:1"), ("li-at", "")]:
+        try:
+            Voyager(*pair)
+            raise AssertionError(f"should have rejected: {pair!r}")
+        except LinkedInError as exc:
+            assert exc.status == 400
 
 
 def main():
@@ -143,7 +145,8 @@ def main():
     assert result["projects"] == []
     assert result["languages"] == []
 
-    check_session_persistence()
+    check_rotation()
+    check_cookie_validation()
 
     print("all checks passed")
 
